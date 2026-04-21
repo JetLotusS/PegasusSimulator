@@ -71,10 +71,13 @@ class MonocularCamera(GraphicalSensor):
         else:
             # Assume a default field of view of 70 degrees
             self.fov = 70.0  # degrees
-            self.fx = 0.5 * self._resolution[0] / torch.tan(0.5 * torch.deg2rad(torch.tensor(self.fov)))
-            self.fy = self.fx
-            self.cx = 0.5 * self._resolution[0]
-            self.cy = 0.5 * self._resolution[1]
+            fov_rad = torch.deg2rad(torch.tensor(self.fov))
+            fx = 0.5 * self._resolution[0] / torch.tan(0.5 * fov_rad)
+
+            self.fx = float(fx)
+            self.fy = float(fx)
+            self.cx = float(0.5 * self._resolution[0])
+            self.cy = float(0.5 * self._resolution[1])
 
         self._intrinsics = torch.tensor([[self.fx, 0.0, self.cx],
                                          [0.0, self.fy, self.cy],
@@ -105,9 +108,27 @@ class MonocularCamera(GraphicalSensor):
             resolution=self._resolution)
         
         # Set the camera position locally with respect to the drone
+
+        # Position
+        if isinstance(self._position, torch.Tensor):
+            position = self._position.detach().clone().to(self.device, dtype=torch.float32)
+        else:
+            position = torch.tensor(self._position, dtype=torch.float32, device=self.device)
+
+        # Orientation
+        if isinstance(self._orientation, torch.Tensor):
+            orientation = self._orientation.detach().clone().to(self.device, dtype=torch.float32)
+        else:
+            orientation = torch.tensor(self._orientation, dtype=torch.float32, device=self.device)
+
+        # Convert degrees -> radians and reorder
+        orientation = torch.deg2rad(torch.flip(orientation, dims=[0]))
+
         self._camera.set_local_pose(
-            torch.tensor(self._position, dtype=torch.float32, device=self.device), 
-            matrix_to_quaternion(euler_angles_to_matrix(angles=torch.deg2rad(torch.flip(self._orientation, dims=[0])), convention="ZYX"))
+            position,
+            matrix_to_quaternion(
+                euler_angles_to_matrix(orientation, "ZYX")
+            )
         )
         
     def start(self):
