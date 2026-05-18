@@ -38,7 +38,7 @@ class RainField:
     Parameters
     ----------
     wind_field    : WindField — drives horizontal drift
-    follow_path   : str | None — prim path whose translation centers the box
+    follow_drone   : str | None — prim path whose translation centers the box
                     (e.g. "/World/CAP3"); None pins to world origin
     num_drops     : int  — instance count (1000=light, 3000=normal, 6000=storm)
     box           : (sx, sy, sz) — drop spawn volume in metres around follow point
@@ -50,7 +50,7 @@ class RainField:
     """
 
     def __init__(self, stage, wind_field,
-                 follow_path   = None,
+                 follow_drone   = None,
                  num_drops     = 3000,
                  box           = (40.0, 40.0, 25.0),
                  fall_speed    = 8.0,
@@ -61,7 +61,7 @@ class RainField:
                  instancer_path= "/World/Rain"):
         self.stage       = stage
         self.wind        = wind_field
-        self.follow_path = follow_path
+        self.follow_drone = follow_drone
         self.N           = int(num_drops)
         self.box         = np.asarray(box, dtype=np.float32)
         self.fall_speed  = float(fall_speed)
@@ -74,33 +74,40 @@ class RainField:
 
     # ------------------------------------------------------------------
     def _build_instancer(self, path, length, radius, color, opacity):
-        inst   = UsdGeom.PointInstancer.Define(self.stage, path)
-        proto  = UsdGeom.Cylinder.Define(self.stage, f"{path}/Proto/Streak")
+        inst = UsdGeom.PointInstancer.Define(self.stage, path)
+
+        UsdGeom.Imageable(inst.GetPrim()).MakeVisible()
+
+        proto_scope = UsdGeom.Scope.Define(self.stage, f"{path}/Prototypes")
+        UsdGeom.Imageable(proto_scope.GetPrim()).MakeInvisible()
+
+        proto = UsdGeom.Cylinder.Define(self.stage, f"{path}/Prototypes/Streak")
         proto.CreateAxisAttr("Z")
         proto.CreateHeightAttr(length)
         proto.CreateRadiusAttr(radius)
         proto.CreateDisplayColorAttr([Gf.Vec3f(*color)])
         proto.CreateDisplayOpacityAttr([float(opacity)])
-        # Hide the prototype itself; only the instancer's copies should draw.
-        UsdGeom.Imageable(proto).MakeInvisible()
 
         inst.CreatePrototypesRel().AddTarget(proto.GetPath())
         self._inst = inst
 
     def _init_positions(self):
         rng = np.random.default_rng()
-        self._pos = (rng.random((self.N, 3), dtype=np.float32) - 0.5) * self.box
+        if self.follow_drone is not None:
+            try:
+                p = self.follow_drone.state.position
+                self._center = np.array([p[0], p[1], p[2]], dtype=np.float32)
+            except Exception:
+                pass
+        self._pos = ((rng.random((self.N, 3), dtype=np.float32) - 0.5) * self.box) + self._center
         self._proto_idx = np.zeros(self.N, dtype=np.int32)
         self._push_all()
 
     def _push_all(self):
-        # Compute orientation from current effective velocity
         v = self._effective_velocity()
         q = _quat_align_z(v)
         orients = Vt.QuathArray([q] * self.N)
-
-        abs_pos = self._pos + self._center
-        self._inst.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(abs_pos))
+        self._inst.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(self._pos))
         self._inst.CreateProtoIndicesAttr().Set(Vt.IntArray.FromNumpy(self._proto_idx))
         self._inst.CreateOrientationsAttr().Set(orients)
         self._last_q = q
@@ -115,33 +122,44 @@ class RainField:
         if dt <= 0.0:
             return
 
-        # Follow the drone
-        if self.follow_path is not None:
-            prim = self.stage.GetPrimAtPath(self.follow_path)
-            if prim.IsValid():
-                t = omni.usd.get_world_transform_matrix(prim).ExtractTranslation()
-                self._center = np.array([t[0], t[1], t[2]], dtype=np.float32)
+        # Track drone position (only used as wrap-around center, not applied to particles)
+        if self.follow_drone is not None:
+            try:
+                p = self.follow_drone.state.position
+                self._center = np.array([p[0], p[1], p[2]], dtype=np.float32)
+            except Exception:
+                pass
 
-        # Advance positions
+        # Advance positions in world space — pure physics, no drone coupling
         v = self._effective_velocity()
         self._pos += v * dt
 
-        # Wrap X/Y modulo box (drops leaving one side re-enter the other)
+        # Periodic wrap of X/Y around the current drone position
         half = self.box * 0.5
+        rel  = self._pos - self._center
         for ax in (0, 1):
-            self._pos[:, ax] = ((self._pos[:, ax] + half[ax]) % self.box[ax]) - half[ax]
-        # Z: drops below floor respawn at top
-        below = self._pos[:, 2] < -half[2]
+            out_pos = rel[:, ax] >  half[ax]
+            out_neg = rel[:, ax] < -half[ax]
+            self._pos[out_pos, ax] -= self.box[ax]
+            self._pos[out_neg, ax] += self.box[ax]
+
+        # Z: drops that fell out the bottom respawn at the top of the box,
+        #    with fresh random X/Y around the drone
+        below = (self._pos[:, 2] - self._center[2]) < -half[2]
         if np.any(below):
-            self._pos[below, 2]    = half[2]
-            # Re-randomize X/Y so respawned drops don't form vertical columns
-            self._pos[below, 0:2]  = (np.random.rand(int(below.sum()), 2).astype(np.float32) - 0.5) * self.box[0:2]
+            n_b = int(below.sum())
+            self._pos[below, 2]    = self._center[2] + half[2]
+            self._pos[below, 0:2]  = (np.random.rand(n_b, 2).astype(np.float32) - 0.5) * self.box[0:2] + self._center[0:2]
 
-        # Write to USD
-        abs_pos = self._pos + self._center
-        self._inst.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(abs_pos))
+        # Drops too far above (drone descended fast) — clamp to top
+        above = (self._pos[:, 2] - self._center[2]) > half[2]
+        if np.any(above):
+            self._pos[above, 2] = self._center[2] + half[2]
 
-        # Orientation only changes if wind direction shifts noticeably
+        # Write world positions
+        self._inst.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(self._pos))
+
+        # Orientation
         q = _quat_align_z(v)
         if q != self._last_q:
             self._inst.GetOrientationsAttr().Set(Vt.QuathArray([q] * self.N))
